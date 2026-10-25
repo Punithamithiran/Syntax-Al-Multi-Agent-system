@@ -9,15 +9,95 @@ const app = express();
 app.use(express.json());
 app.use(cors());
 
-// Supabase (PostgreSQL) connection pool
-const db = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false } // Required for Supabase
-});
+// Database connection: PostgreSQL (Supabase) with automatic fallback to local SQLite
+const { DatabaseSync } = require("node:sqlite");
 
-db.on("connect", () => {
-  console.log("Connected to Supabase (PostgreSQL) database.");
-});
+let pgPool = null;
+let useSqlite = false;
+let sqliteDb = null;
+
+function getSqliteDb() {
+  if (!sqliteDb) {
+    const sqlitePath = path.join(__dirname, "../syntax_ai.db");
+    sqliteDb = new DatabaseSync(sqlitePath);
+    sqliteDb.exec(`
+      CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        password TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE TABLE IF NOT EXISTS user_activity (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        user_option TEXT,
+        language TEXT,
+        qn TEXT,
+        modify_code_input TEXT,
+        modify_code_logic TEXT,
+        output TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    console.log("📁 Using local SQLite database at:", sqlitePath);
+  }
+  return sqliteDb;
+}
+
+if (process.env.DATABASE_URL) {
+  try {
+    pgPool = new Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: { rejectUnauthorized: false }
+    });
+    pgPool.on("connect", () => {
+      console.log("Connected to Supabase (PostgreSQL) database.");
+    });
+    pgPool.on("error", (err) => {
+      console.warn("PostgreSQL Pool error, falling back to SQLite:", err.message);
+      useSqlite = true;
+    });
+  } catch (err) {
+    useSqlite = true;
+  }
+} else {
+  useSqlite = true;
+}
+
+const db = {
+  async query(sql, params = []) {
+    if (!useSqlite && pgPool) {
+      try {
+        return await pgPool.query(sql, params);
+      } catch (err) {
+        console.warn(`PostgreSQL query error (${err.message}). Falling back to local SQLite.`);
+        useSqlite = true;
+      }
+    }
+
+    const sdb = getSqliteDb();
+    if (sql.includes("INSERT INTO users")) {
+      const stmt = sdb.prepare("INSERT INTO users (username, password) VALUES (?, ?)");
+      const info = stmt.run(params[0], params[1]);
+      return { rows: [{ id: Number(info.lastInsertRowid) }] };
+    } else if (sql.includes("SELECT id FROM users")) {
+      const stmt = sdb.prepare("SELECT id FROM users WHERE username = ? AND password = ?");
+      const rows = stmt.all(params[0], params[1]);
+      return { rows };
+    } else if (sql.includes("INSERT INTO user_activity")) {
+      const stmt = sdb.prepare(
+        "INSERT INTO user_activity (user_id, user_option, language, qn, modify_code_input, modify_code_logic, output) VALUES (?, ?, ?, ?, ?, ?, ?)"
+      );
+      stmt.run(...params);
+      return { rows: [] };
+    } else {
+      const sqliteSql = sql.replace(/\$\d+/g, "?").replace(/RETURNING\s+id/i, "");
+      const stmt = sdb.prepare(sqliteSql);
+      const rows = stmt.all(...params);
+      return { rows };
+    }
+  }
+};
 
 // Authentication route for login/signup
 app.post("/auth", async (req, res) => {
